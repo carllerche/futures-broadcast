@@ -1,0 +1,16 @@
+[package]
+name = "futures-broadcast"
+version = "0.1.0"
+authors = ["Carl Lerche <me@carllerche.com>"]
+license = "MIT/Apache-2.0"
+readme = "README.md"
+keywords = ["futures", "async", "future"]
+repository = "https://github.com/carllerche/futures-broadcast"
+homepage = "https://github.com/carllerche/futures-broadcast"
+documentation = "https://docs.rs/futures-broadcast"
+description = """
+A futures aware, bounded, MPMC broadcast channel with back pressure support.
+"""
+
+[dependencies]
+futures = "0.1"
