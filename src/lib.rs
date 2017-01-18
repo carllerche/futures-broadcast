@@ -1,9 +1,9 @@
 #[macro_use]
 extern crate futures;
 
-// mod atomic;
-// mod stack;
-// mod mutex;
+mod atomic_task;
+
+use atomic_task::AtomicTask;
 
 use futures::{Stream, Sink, Poll, StartSend, Async, AsyncSink};
 use futures::task::{self, Task};
@@ -110,6 +110,9 @@ struct Inner<T> {
 
     // Used by publishers and when receivers are cloned.
     pub_state: PubCell,
+
+    // Number of outstanding senders
+    num_tx: AtomicUsize,
 }
 
 // Contains the `PubState`
@@ -139,17 +142,27 @@ struct Entry<T> {
     // Value being published
     value: UnsafeCell<Option<T>>,
 
-    // Linked list of waiter nodes. These can either be `WaitingTx` or
-    // `WaitingRx` depending on the state stored in `sequence`.
+    // Head of the `WaitingRx` stack
     waiting_rx: AtomicPtr<WaitingRx>,
+
+    // Pointer to a waiting TX node.
+    waiting_tx: AtomicPtr<WaitingTx<T>>,
 }
 
 // Used to track a waiter. Node in a linked-list.
 struct WaitingRx {
     // Parked task
-    task: Task,
+    task: AtomicTask,
     // Next waiter
     next: AtomicPtr<WaitingRx>,
+}
+
+struct WaitingTx<T> {
+    // Parked task
+    task: AtomicTask,
+
+    // queued value
+    value: T,
 }
 
 // Used as masks
@@ -175,6 +188,27 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 // ===== impl Sender =====
 
 impl<T> Sender<T> {
+    /// Try to clone the `Sender`. This will fail if there are too many
+    /// outstanding senders.
+    pub fn try_clone(&self) -> Result<Self, ()> {
+        let mut curr = self.inner.num_tx.load(Relaxed);
+
+        loop {
+            if curr == self.inner.buffer.len() {
+                return Err(());
+            }
+
+            let actual = self.inner.num_tx.compare_and_swap(curr, curr + 1, Relaxed);
+
+            if actual == curr {
+                return Ok(Sender {
+                    inner: self.inner.clone(),
+                });
+            }
+
+            curr = actual;
+        }
+    }
 }
 
 impl<T> Sink for Sender<T> {
@@ -196,8 +230,10 @@ impl<T> Sink for Sender<T> {
                         // CAS succeeded, update the value
                         entry.set(item, pub_state);
 
+                        let color = color_for(pub_state.pos, mask);
+
                         // Notify receivers
-                        entry.notify_rx();
+                        entry.notify_rx(color);
 
                         return Ok(AsyncSink::Ready);
                     }
@@ -247,11 +283,9 @@ impl<T> Receiver<T> {
             // Get the sequence number
             let seq = entry.sequence.load(Acquire);
 
-            // The sender's `pos` will always lag behind the sequence value.
-            // This guarantees that the subtraction will not overflow.
-            let state = seq.wrapping_sub(pos);
+            let diff: isize = (seq as isize).wrapping_sub((pos + 1) as isize);
 
-            if state & FULL == FULL {
+            if diff == 0 {
                 // The slot is full, get a reference to the value.
                 unsafe {
                     (*entry.value.get()).as_ref().unwrap()
@@ -267,7 +301,9 @@ impl<T> Receiver<T> {
                 // Push the node onto the stack, returns `false` if the TX half
                 // has "terminated" the stack indicating that a value is now
                 // available.
-                if push_waiter(&entry.waiting_rx, waiter) {
+                let color = color_for(pos, mask);
+
+                if push_waiter(&entry.waiting_rx, waiter, color) {
                     // The wait has been successfully issued, now return w/
                     // NotReady
                     return Ok(Async::NotReady);
@@ -279,9 +315,10 @@ impl<T> Receiver<T> {
                 // `Relaxed` ordering is used here as the memory ordering is
                 // actually established in `push_node`.
 
-                let state = entry.sequence.load(Relaxed).wrapping_sub(pos);
+                let seq = entry.sequence.load(Relaxed);
+                let diff: isize = (seq as isize).wrapping_sub((pos + 1) as isize);
 
-                if state & FULL == FULL {
+                if diff == 0 {
                     // The entry is full, get a reference to the value.
                     unsafe {
                         (*entry.value.get()).as_ref().unwrap()
@@ -304,13 +341,15 @@ impl<T> Receiver<T> {
 
 fn rx_waiter(cell: &mut Option<Arc<WaitingRx>>) -> Arc<WaitingRx> {
     if let Some(ref w) = *cell {
-        if w.task.is_current() {
-            return w.clone();
-        }
+        // Concurrent calls to `AtomicTask::park()` are guaranteed by having a
+        // &mut reference to the cell.
+        unsafe { w.task.park() };
+
+        return w.clone();
     }
 
     let w = Arc::new(WaitingRx {
-        task: task::park(),
+        task: AtomicTask::new(task::park()),
         next: AtomicPtr::new(ptr::null_mut()),
     });
 
@@ -319,7 +358,7 @@ fn rx_waiter(cell: &mut Option<Arc<WaitingRx>>) -> Arc<WaitingRx> {
 }
 
 // TODO: Move this to a fn on `Entry`
-fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
+fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>, target_color: usize) -> bool {
     // Push a waiter node onto the atomic wait stack.
     unsafe {
         // Only push nodes without a `next` pointer
@@ -335,7 +374,9 @@ fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
         let node_ptr: *mut WaitingRx = mem::transmute(node);
 
         loop {
-            if curr == closed() {
+            let (head_ptr, color) = atomic_to_ptr_and_color(curr);
+
+            if color == target_color {
                 // The wait stack is closed. The node will not be CASed to the
                 // stack, so transmute back to the Arc so that the refcount is
                 // decremented and unset the `next` node before the value is
@@ -346,9 +387,10 @@ fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
             }
 
             // Update next pointer.
-            (*node_ptr).next.store(curr, Relaxed);
+            (*node_ptr).next.store(head_ptr, Relaxed);
 
-            let actual = head.compare_and_swap(curr, node_ptr, Release);
+            let next = ptr_and_color_to_atomic(node_ptr, color);
+            let actual = head.compare_and_swap(curr, next, Release);
 
             if actual == curr {
                 return true;
@@ -359,10 +401,39 @@ fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
     }
 }
 
+/// Splits the value in the `AtomicPtr` into the actual pointer and the color
+fn atomic_to_ptr_and_color<T>(ptr: *mut T) -> (*mut T, usize) {
+    let ptr = ptr as usize;
+    let color = ptr & 1;
+    let ptr = (ptr & !1) as *mut T;
+
+    (ptr, color)
+}
+
+/// Combines a pointer and a color into a single pointer to store in the
+/// `AtomicPtr`
+fn ptr_and_color_to_atomic<T>(ptr: *mut T, color: usize) -> *mut T {
+    let ptr = ptr as usize | color;
+    ptr as *mut T
+}
+
+/// Takes a `pos` and a `mask` and returns the associated color
+fn color_for(pos: usize, mask: usize) -> usize {
+    let mask = (mask << 1) & (!mask);
+
+    if pos & mask == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/*
 /// Returns a "closed" token
 fn closed<T>() -> *mut T {
     unsafe { mem::transmute(1usize) }
 }
+*/
 
 impl<T: Clone> Stream for Receiver<T> {
     type Item = T;
@@ -396,12 +467,16 @@ impl<T> Inner<T> {
         // Initialize the ring as a vec of vaccant entries
         let mut buffer = Vec::with_capacity(capacity);
 
+        // Initialize the waiting_rx, setting the color to `1`
+        let waiting_rx = ptr_and_color_to_atomic(ptr::null_mut(), 1);
+
         for i in 0..capacity {
             buffer.push(Entry {
                 sequence: AtomicUsize::new(i),
                 value: UnsafeCell::new(None),
                 remaining: AtomicUsize::new(0),
-                waiting_rx: AtomicPtr::new(ptr::null_mut()),
+                waiting_rx: AtomicPtr::new(waiting_rx),
+                waiting_tx: AtomicPtr::new(ptr::null_mut()),
             });
         }
 
@@ -409,6 +484,7 @@ impl<T> Inner<T> {
             buffer: buffer,
             mask: capacity - 1,
             pub_state: PubCell::new(),
+            num_tx: AtomicUsize::new(1),
         }
     }
 }
@@ -474,20 +550,24 @@ impl<T> Entry<T> {
         self.sequence.store(pub_state.pos + 1, Release);
     }
 
-    fn notify_rx(&self) {
+    fn notify_rx(&self, color: usize) {
+        let closed_ptr = ptr_and_color_to_atomic(ptr::null_mut(), color);
+
         // Take the stack of waiters
         //
         // Acquire the waiting_rx state and release the "set value" state.
-        let mut curr = self.waiting_rx.swap(closed(), AcqRel);
+        let curr = self.waiting_rx.swap(closed_ptr, AcqRel);
 
-        while !curr.is_null() {
+        let (mut ptr, _) = atomic_to_ptr_and_color(curr);
+
+        while !ptr.is_null() {
             unsafe {
-                let node: Arc<WaitingRx> = mem::transmute(curr);
+                let node: Arc<WaitingRx> = mem::transmute(ptr);
 
                 // Unpark the task
                 node.task.unpark();
 
-                curr = node.next.swap(ptr::null_mut(), Release);
+                ptr = node.next.swap(ptr::null_mut(), Release);
             }
         }
     }

@@ -39,21 +39,78 @@ fn send_recv() {
 
 #[test]
 fn receiver_wait() {
-    let (tx1, rx1) = pubsub::channel::<i32>(16);
+    let (mut tx1, rx1) = pubsub::channel::<i32>(1);
     let (tx2, rx2) = mpsc::channel();
 
     {
         thread::spawn(move || {
             let mut rx = rx1.wait();
-            tx2.send(rx.next().unwrap().unwrap()).unwrap();
+
+            for _ in 0..5 {
+                tx2.send(rx.next().unwrap().unwrap()).unwrap();
+            }
         });
     }
 
-    thread::sleep(Duration::from_millis(50));
+    for i in 0..5 {
+        thread::sleep(Duration::from_millis(50));
 
-    let tx1 = tx1.send(123).wait().unwrap();
-
-    assert_eq!(rx2.recv().unwrap(), 123);
+        tx1 = tx1.send(i).wait().unwrap();
+        assert_eq!(rx2.recv().unwrap(), i);
+    }
 
     drop(tx1);
+}
+
+#[test]
+fn wrapping_receiver_wait() {
+    let (mut pu, su) = pubsub::channel::<i32>(2);
+
+    let (tx1, rx1) = mpsc::channel();
+    let (tx2, rx2) = mpsc::channel();
+
+    // Fast subscriber
+    {
+        let su = su.new_receiver();
+
+        thread::spawn(move || {
+            let mut su = su.wait();
+
+            for _ in 0..4 {
+                tx1.send(su.next().unwrap().unwrap()).unwrap();
+            }
+        });
+    }
+
+    // Slow subscriber
+    {
+        thread::spawn(move || {
+            let mut su = su.wait();
+
+            for _ in 0..4 {
+                thread::sleep(Duration::from_millis(50));
+                tx2.send(su.next().unwrap().unwrap()).unwrap();
+            }
+        });
+    }
+
+    for i in 0..2 {
+        for j in 0..2 {
+            thread::sleep(Duration::from_millis(10));
+
+            pu = pu.send(i * 2 + j).wait().unwrap();
+        }
+
+        for rx in &[&rx1, &rx2] {
+            for j in 0..2 {
+                assert_eq!(i * 2 + j, rx.recv().unwrap());
+            }
+        }
+    }
+
+    for rx in &[rx1, rx2] {
+        assert!(rx.recv().is_err());
+    }
+
+    drop(pu);
 }
