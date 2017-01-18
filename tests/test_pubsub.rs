@@ -6,7 +6,7 @@ use futures::future::lazy;
 
 use std::time::Duration;
 use std::thread;
-use std::sync::{Arc, Mutex};
+use std::sync::{mpsc, Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, Ordering};
 
 fn is_send<T: Send>() {}
@@ -21,8 +21,7 @@ fn bounds() {
 }
 
 #[test]
-fn smoke() {
-// fn send_recv() {
+fn send_recv() {
     let (tx, rx) = pubsub::channel::<i32>(16);
 
     let mut rx1 = rx.new_receiver().wait();
@@ -36,4 +35,25 @@ fn smoke() {
 
     assert_eq!(rx2.next().unwrap(), Ok(1));
     assert_eq!(rx2.next().unwrap(), Ok(2));
+}
+
+#[test]
+fn receiver_wait() {
+    let (tx1, rx1) = pubsub::channel::<i32>(16);
+    let (tx2, rx2) = mpsc::channel();
+
+    {
+        thread::spawn(move || {
+            let mut rx = rx1.wait();
+            tx2.send(rx.next().unwrap().unwrap()).unwrap();
+        });
+    }
+
+    thread::sleep(Duration::from_millis(50));
+
+    let tx1 = tx1.send(123).wait().unwrap();
+
+    assert_eq!(rx2.recv().unwrap(), 123);
+
+    drop(tx1);
 }

@@ -8,11 +8,11 @@ extern crate futures;
 use futures::{Stream, Sink, Poll, StartSend, Async, AsyncSink};
 use futures::task::{self, Task};
 
-use std::{ops, ptr, usize};
+use std::{ops, mem, ptr, usize};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicUsize, AtomicPtr};
-use std::sync::atomic::Ordering::{Acquire, Release, Relaxed};
+use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
 
 // The core algorithm is based on the mpmc array channel from 1024 cores.
 //
@@ -94,7 +94,6 @@ pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
     pos: usize,
     waiter: Option<Arc<WaitingRx>>,
-    // waiting: bool,
 }
 
 pub struct RecvGuard<'a, T: 'a> {
@@ -149,14 +148,12 @@ struct Entry<T> {
 struct WaitingRx {
     // Parked task
     task: Task,
-    // Next waiter, this needs to be in an `UnsafeCell` so that the receiver can
-    // update this value through an `Arc`.
-    next: UnsafeCell<Option<Arc<WaitingRx>>>,
+    // Next waiter
+    next: AtomicPtr<WaitingRx>,
 }
 
 // Used as masks
 const FULL: usize = 1;
-const WAITERS: usize = 2;
 
 /// Returns a channel
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
@@ -191,16 +188,17 @@ impl<T> Sink for Sender<T> {
         loop {
             let entry = &self.inner.buffer[pub_state.pos & mask];
             let seq = entry.sequence.load(Acquire);
-            let diff: isize = seq as isize - pub_state.pos as isize;
 
-            if diff == 0 {
+            if seq == pub_state.pos {
                 // The slot is available, we can attempt to acquire the slot
                 match self.inner.pub_state.claim_slot(pub_state) {
                     Ok(_) => {
                         // CAS succeeded, update the value
                         entry.set(item, pub_state);
 
-                        // TODO: Wakeup subscribers
+                        // Notify receivers
+                        entry.notify_rx();
+
                         return Ok(AsyncSink::Ready);
                     }
                     Err(actual_state) => {
@@ -208,7 +206,7 @@ impl<T> Sink for Sender<T> {
                         pub_state = actual_state;
                     }
                 }
-            } else if diff < 0 {
+            } else if seq < pub_state.pos {
                 // Full
                 unimplemented!();
             } else {
@@ -226,7 +224,6 @@ impl<T> Sink for Sender<T> {
 // ===== impl Receiver =====
 
 impl<T> Receiver<T> {
-
     /// Returns a new receiver positioned at the head of the channel
     pub fn new_receiver(&self) -> Receiver<T> {
         let pos = self.inner.pub_state.inc_rx();
@@ -252,7 +249,7 @@ impl<T> Receiver<T> {
 
             // The sender's `pos` will always lag behind the sequence value.
             // This guarantees that the subtraction will not overflow.
-            let state = seq - pos;
+            let state = seq.wrapping_sub(pos);
 
             if state & FULL == FULL {
                 // The slot is full, get a reference to the value.
@@ -270,7 +267,7 @@ impl<T> Receiver<T> {
                 // Push the node onto the stack, returns `false` if the TX half
                 // has "terminated" the stack indicating that a value is now
                 // available.
-                if push_node(&entry.waiting_rx, waiter) {
+                if push_waiter(&entry.waiting_rx, waiter) {
                     // The wait has been successfully issued, now return w/
                     // NotReady
                     return Ok(Async::NotReady);
@@ -282,7 +279,7 @@ impl<T> Receiver<T> {
                 // `Relaxed` ordering is used here as the memory ordering is
                 // actually established in `push_node`.
 
-                let state = entry.sequence.load(Relaxed) - pos;
+                let state = entry.sequence.load(Relaxed).wrapping_sub(pos);
 
                 if state & FULL == FULL {
                     // The entry is full, get a reference to the value.
@@ -314,15 +311,57 @@ fn rx_waiter(cell: &mut Option<Arc<WaitingRx>>) -> Arc<WaitingRx> {
 
     let w = Arc::new(WaitingRx {
         task: task::park(),
-        next: UnsafeCell::new(None),
+        next: AtomicPtr::new(ptr::null_mut()),
     });
 
     *cell = Some(w.clone());
     w
 }
 
-fn push_node(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
-    unimplemented!();
+// TODO: Move this to a fn on `Entry`
+fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
+    // Push a waiter node onto the atomic wait stack.
+    unsafe {
+        // Only push nodes without a `next` pointer
+        if !node.next.load(Acquire).is_null() {
+            // Task is currently queued
+            return true;
+        }
+
+        let mut curr = head.load(Acquire);
+
+        // Transmute the Arc<WaitingRx> -> an unsafe ptr. This ptr will be
+        // stored in the AtomicPtr stack
+        let node_ptr: *mut WaitingRx = mem::transmute(node);
+
+        loop {
+            if curr == closed() {
+                // The wait stack is closed. The node will not be CASed to the
+                // stack, so transmute back to the Arc so that the refcount is
+                // decremented and unset the `next` node before the value is
+                // dropped.
+                let _: Arc<WaitingRx> = mem::transmute(node_ptr);
+
+                return false;
+            }
+
+            // Update next pointer.
+            (*node_ptr).next.store(curr, Relaxed);
+
+            let actual = head.compare_and_swap(curr, node_ptr, Release);
+
+            if actual == curr {
+                return true;
+            }
+
+            curr = actual;
+        }
+    }
+}
+
+/// Returns a "closed" token
+fn closed<T>() -> *mut T {
+    unsafe { mem::transmute(1usize) }
 }
 
 impl<T: Clone> Stream for Receiver<T> {
@@ -433,6 +472,24 @@ impl<T> Entry<T> {
         // Store the sequence number, which makes the entry visible to
         // subscribers
         self.sequence.store(pub_state.pos + 1, Release);
+    }
+
+    fn notify_rx(&self) {
+        // Take the stack of waiters
+        //
+        // Acquire the waiting_rx state and release the "set value" state.
+        let mut curr = self.waiting_rx.swap(closed(), AcqRel);
+
+        while !curr.is_null() {
+            unsafe {
+                let node: Arc<WaitingRx> = mem::transmute(curr);
+
+                // Unpark the task
+                node.task.unpark();
+
+                curr = node.next.swap(ptr::null_mut(), Release);
+            }
+        }
     }
 }
 
