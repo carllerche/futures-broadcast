@@ -1,14 +1,90 @@
 #[macro_use]
 extern crate futures;
 
+// mod atomic;
+// mod stack;
+// mod mutex;
+
 use futures::{Stream, Sink, Poll, StartSend, Async, AsyncSink};
 use futures::task::{self, Task};
 
-use std::{ops, usize};
+use std::{ops, ptr, usize};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize};
+use std::sync::atomic::{AtomicUsize, AtomicPtr};
 use std::sync::atomic::Ordering::{Acquire, Release, Relaxed};
+
+// The core algorithm is based on the mpmc array channel from 1024 cores.
+//
+// * When a sender "blocks", it inserts it's "task" node into the entry
+// * When a receiver "blocks", it inserts it's task node into the entry
+//
+// # Guarantees
+//
+// When a TX is working on an entry, there will never be another TX which
+// will operate on the same entry. This means that, as long as the `TX` is
+// in the `send` phase, there will never be other TX waiters.
+//
+// When an RX is working on an entry, it is not possible for the sequence to
+// cycle as all RX handles must complete "seeing" the value.
+//
+// It *is* possible for all RX handles to see a value before the TX send fn
+// completes.
+//
+// # Notes
+//
+// Separate TX & RX wait stacks are necessary as there could be races between a
+// TX trying to wait, and the RX pushing a value & another RX getting blocked on
+// the full entry.
+//
+// # Entry states
+//
+// * EMPTY
+// * EMPTY_WAITERS
+// * FULL - TX puts value from EMPTY state
+// * FULL_WAITERS - RX waiting for slot, includes value
+//
+// # Events
+//
+// 1 - RX calls `recv` and encounters `EMPTY` state.
+//   1.1 - Push waiter onto RX wait stack.
+//   1.2 - State `EMPTY` -> `EMPTY_WAITERS`
+//      1.2.1 - Fail w/ `FULL`, take waiters & notify if not self
+//      1.2.2 - Fail w/ `EMPTY_WAITERS`, do nothing
+//      1.2.3 - Success, return
+//
+// 2 - RX calls `recv` w/ `EMPTY_WAITERS` state.
+//    2.1 - Push waiter onto RX wait stack.
+//    2.2 - Confirm state `EMPTY_WAITERS`
+//      2.2.1 - Success, return
+//      2.2.2 - Fail w/ `FULL`, take waiters & notify if not self
+//
+// 3 - TX sends value, `EMPTY` state
+//   3.1 - Set value
+//   3.2 - Transition `EMPTY` -> `FULL`
+//      3.2.1 - Fail, state must be `EMPTY_WAITERS` GOTO 4.2
+//      3.2.2 - Success, no other work
+//
+// 4 - TX sends value, `EMPTY_WAITERS` state
+//   4.1 - Set value
+//   4.2 - Transition `EMPTY_WAITERS` -> `FULL` (must succeed)
+//      4.2.1 - Take all waiters & notify
+//
+//
+// # Sequence state
+//
+// `0` - Entry empty
+// `1` - Entry full
+// `2` - Empty with waiting subscribers
+// `3` - Full with waiting publisher
+//
+// # Limitations
+//
+// * The minimum capacity must be 4 in order to allow enough lower bits in the
+//   sequence number to store the entry state.
+//
+// * The max number of outstanding senders must be less than or equal to the
+//   channel capacity.
 
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
@@ -17,6 +93,8 @@ pub struct Sender<T> {
 pub struct Receiver<T> {
     inner: Arc<Inner<T>>,
     pos: usize,
+    waiter: Option<Arc<WaitingRx>>,
+    // waiting: bool,
 }
 
 pub struct RecvGuard<'a, T: 'a> {
@@ -61,7 +139,24 @@ struct Entry<T> {
 
     // Value being published
     value: UnsafeCell<Option<T>>,
+
+    // Linked list of waiter nodes. These can either be `WaitingTx` or
+    // `WaitingRx` depending on the state stored in `sequence`.
+    waiting_rx: AtomicPtr<WaitingRx>,
 }
+
+// Used to track a waiter. Node in a linked-list.
+struct WaitingRx {
+    // Parked task
+    task: Task,
+    // Next waiter, this needs to be in an `UnsafeCell` so that the receiver can
+    // update this value through an `Arc`.
+    next: UnsafeCell<Option<Arc<WaitingRx>>>,
+}
+
+// Used as masks
+const FULL: usize = 1;
+const WAITERS: usize = 2;
 
 /// Returns a channel
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
@@ -74,6 +169,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
     let rx = Receiver {
         inner: inner,
         pos: 0,
+        waiter: None,
     };
 
     (tx, rx)
@@ -138,6 +234,7 @@ impl<T> Receiver<T> {
         Receiver {
             inner: self.inner.clone(),
             pos: pos,
+            waiter: None,
         }
     }
 
@@ -152,17 +249,51 @@ impl<T> Receiver<T> {
 
             // Get the sequence number
             let seq = entry.sequence.load(Acquire);
-            let diff: isize = seq as isize - (pos + 1) as isize;
 
-            if diff == 0 {
+            // The sender's `pos` will always lag behind the sequence value.
+            // This guarantees that the subtraction will not overflow.
+            let state = seq - pos;
+
+            if state & FULL == FULL {
+                // The slot is full, get a reference to the value.
                 unsafe {
                     (*entry.value.get()).as_ref().unwrap()
                 }
-            } else if diff < 0 {
-                // unimplemented!();
-                return Err(());
-            } else {
-                unimplemented!();
+            }
+            else {
+                // No value present, attempt to wait
+                //
+                // First, get a waiter. `rx_waiter` ensures that the
+                // `Receiver`'s wait node references the current task.
+                let waiter = rx_waiter(&mut self.waiter);
+
+                // Push the node onto the stack, returns `false` if the TX half
+                // has "terminated" the stack indicating that a value is now
+                // available.
+                if push_node(&entry.waiting_rx, waiter) {
+                    // The wait has been successfully issued, now return w/
+                    // NotReady
+                    return Ok(Async::NotReady);
+                }
+
+                // Pushing the node failed, this implies that the TX half
+                // "shutdown" the wait queue, transitioning to `FULL`.
+                //
+                // `Relaxed` ordering is used here as the memory ordering is
+                // actually established in `push_node`.
+
+                let state = entry.sequence.load(Relaxed) - pos;
+
+                if state & FULL == FULL {
+                    // The entry is full, get a reference to the value.
+                    unsafe {
+                        (*entry.value.get()).as_ref().unwrap()
+                    }
+                } else {
+                    // The entry is not full, meaning that all TX handles were
+                    // dropped.
+                    unimplemented!();
+                }
             }
         };
 
@@ -172,6 +303,26 @@ impl<T> Receiver<T> {
             value: value,
         })))
     }
+}
+
+fn rx_waiter(cell: &mut Option<Arc<WaitingRx>>) -> Arc<WaitingRx> {
+    if let Some(ref w) = *cell {
+        if w.task.is_current() {
+            return w.clone();
+        }
+    }
+
+    let w = Arc::new(WaitingRx {
+        task: task::park(),
+        next: UnsafeCell::new(None),
+    });
+
+    *cell = Some(w.clone());
+    w
+}
+
+fn push_node(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>) -> bool {
+    unimplemented!();
 }
 
 impl<T: Clone> Stream for Receiver<T> {
@@ -211,6 +362,7 @@ impl<T> Inner<T> {
                 sequence: AtomicUsize::new(i),
                 value: UnsafeCell::new(None),
                 remaining: AtomicUsize::new(0),
+                waiting_rx: AtomicPtr::new(ptr::null_mut()),
             });
         }
 
