@@ -8,11 +8,11 @@ use atomic_task::AtomicTask;
 use atomic_u64::AtomicU64;
 
 use futures::{Stream, Sink, Poll, StartSend, Async, AsyncSink};
-use futures::task::{self, Task};
+use futures::task;
 
 use std::{ops, mem, ptr, u32, usize};
 use std::cell::UnsafeCell;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicPtr};
 use std::sync::atomic::Ordering::{self, Acquire, Release, AcqRel, Relaxed};
 
@@ -104,7 +104,7 @@ struct Entry<T> {
     // waiting_rx: AtomicPtr<WaitingRx>,
 
     // Pointer to a waiting TX node.
-    waiting_tx: AtomicPtr<WaitingTx<T>>,
+    waiting_tx: UnsafeCell<Option<Arc<WaitingTx<T>>>>,
 }
 
 // Used to track a waiter. Node in a linked-list.
@@ -119,8 +119,8 @@ struct WaitingTx<T> {
     // Parked task
     task: AtomicTask,
 
-    // queued value
-    value: UnsafeCell<Option<T>>,
+    // Queued (value, num-rx)
+    value: UnsafeCell<Option<(T, usize)>>,
 
     // True if parked
     parked: AtomicBool,
@@ -200,7 +200,7 @@ impl<T> Sink for Sender<T> {
     type SinkItem = T;
     type SinkError = ();
 
-    fn start_send(&mut self, item: T) -> StartSend<T, ()> {
+    fn start_send(&mut self, mut item: T) -> StartSend<T, ()> {
         if self.is_parked() {
             return Ok(AsyncSink::NotReady(item));
         }
@@ -239,7 +239,7 @@ impl<T> Sink for Sender<T> {
                         .. entry_state
                     };
 
-                    let actual = entry.state.compare_and_swap(entry_state, next, Release);
+                    let actual = entry.state.compare_and_swap(entry_state, next, AcqRel);
 
                     if actual == entry_state {
                         break;
@@ -254,7 +254,40 @@ impl<T> Sink for Sender<T> {
                 return Ok(AsyncSink::Ready);
 
             } else {
-                unimplemented!();
+                // The slot is occupied, so store the item in the waiting_tx
+                // slot
+
+                let mut waiter = tx_waiter(&mut self.waiter, item, pub_state.num_rx());
+
+                // Store the waiter in the slot
+                unsafe {
+                    // The slot should be empty...
+                    debug_assert!((*entry.waiting_tx.get()).is_none());
+
+                    // Store the waiter
+                    (*entry.waiting_tx.get()) = Some(waiter);
+                };
+
+                let next = State {
+                    // Set the toggle, indicating that the TX is waiting
+                    toggled: true,
+                    .. entry_state
+                };
+
+                // Attempt to CAS
+                let actual = entry.state.compare_and_swap(entry_state, next, AcqRel);
+
+                if entry_state == actual {
+                    return Ok(AsyncSink::Ready);
+                }
+
+                // The CAS failed, remove the waiting node, re-acquire the item,
+                // and try the process again
+                waiter = unsafe { (*entry.waiting_tx.get()).take().unwrap() };
+                let (i, _) = unsafe { (*waiter.value.get()).take().unwrap() };
+                item = i;
+
+                entry_state = actual;
             }
         }
     }
@@ -272,13 +305,12 @@ fn pos_to_sequence(pos: usize, mask: usize) -> usize {
     }
 }
 
-/*
-fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T) -> Arc<WaitingTx<T>> {
+fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T, num_rx: usize) -> Arc<WaitingTx<T>> {
     if let Some(ref w) = *cell {
         unsafe {
             w.task.park();
 
-            (*w.value.get()) = Some(item);
+            (*w.value.get()) = Some((item, num_rx));
         }
 
         w.parked.store(true, Release);
@@ -288,14 +320,13 @@ fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T) -> Arc<WaitingTx<
 
     let w = Arc::new(WaitingTx {
         task: AtomicTask::new(task::park()),
-        value: UnsafeCell::new(Some(item)),
+        value: UnsafeCell::new(Some((item, num_rx))),
         parked: AtomicBool::new(true),
     });
 
     *cell = Some(w.clone());
     w
 }
-*/
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
@@ -446,12 +477,12 @@ impl<T> Inner<T> {
         // Initialize the ring as a vec of vaccant entries
         let mut buffer = Vec::with_capacity(capacity);
 
-        for i in 0..capacity {
+        for _ in 0..capacity {
             buffer.push(Entry {
                 state: StateCell::new(),
                 value: UnsafeCell::new(None),
                 remaining: AtomicUsize::new(0),
-                waiting_tx: AtomicPtr::new(ptr::null_mut()),
+                waiting_tx: UnsafeCell::new(None),
             });
         }
 
@@ -464,6 +495,12 @@ impl<T> Inner<T> {
             pub_state: PubCell::new(),
             num_tx: AtomicUsize::new(1),
         }
+    }
+}
+
+impl<T> Drop for Inner<T> {
+    fn drop(&mut self) {
+        // TODO: Clear out all internal state
     }
 }
 
@@ -610,6 +647,11 @@ impl StateCell {
         State::load(val)
     }
 
+    fn swap(&self, next: State, ordering: Ordering) -> State {
+        let val = self.state.swap(next.as_usize(), ordering);
+        State::load(val)
+    }
+
     fn compare_and_swap(&self, current: State, next: State, ordering: Ordering) -> State {
         let val = self.state.compare_and_swap(current.as_usize(), next.as_usize(), ordering);
         State::load(val)
@@ -685,7 +727,9 @@ impl<'a, T> Drop for RecvGuard<'a, T> {
         let entry = &self.recv.inner.buffer[pos & mask];
 
         // Decrement the remaining receivers
-        if 1 == entry.remaining.fetch_sub(1, AcqRel) {
+        let prev = entry.remaining.fetch_sub(1, AcqRel);
+
+        if 1 ==  prev {
             // Remove the value
             unsafe { (*entry.value.get()) = None };
 
@@ -698,8 +742,46 @@ impl<'a, T> Drop for RecvGuard<'a, T> {
 
             loop {
                 if entry_state.toggled {
-                    // A TX is waiting
-                    unimplemented!();
+                    let waiter = unsafe {
+                        // A TX is waiting, take the waiter..
+                        let waiter = (*entry.waiting_tx.get()).take().unwrap();
+
+                        // Get the item
+                        let (item, num_rx) = (*waiter.value.get()).take().unwrap();
+
+                        // Store the item in the entry
+                        (*entry.value.get()) = Some(item);
+
+                        // Reset the number of remaining receivers to observe
+                        // the value.
+                        //
+                        // `Relaxed` ordering is used as the entry state gates
+                        // reads.
+                        entry.remaining.store(num_rx, Relaxed);
+
+                        waiter
+                    };
+
+                    let next = State {
+                        waiting_rx: ptr::null_mut(),
+                        sequence: (entry_state.sequence + 1) % 2,
+                        toggled: false,
+                        .. entry_state
+                    };
+
+                    // At this point, this is the only thread that will attempt
+                    // to mutate the state slot, so there is no need for a CAS.
+                    let prev = entry.state.swap(next, Release);
+                    debug_assert!(entry_state == prev);
+
+                    // Unpark the TX waiter
+                    waiter.parked.store(false, Release);
+                    waiter.task.unpark();
+
+                    // Unpark any RX waiting on the slot
+                    entry_state.notify_rx();
+
+                    break;
                 }
 
                 let next = State {

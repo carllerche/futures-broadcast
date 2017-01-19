@@ -31,6 +31,9 @@ const LOCKED_WRITE_NOTIFIED: usize = 1;
 
 
 /// The `unpark` function has locked access to the task cell for notification.
+///
+/// The constant is left here mostly for documentation reasons.
+#[allow(dead_code)]
 const LOCKED_READ: usize = 3;
 
 impl AtomicTask {
@@ -49,7 +52,7 @@ impl AtomicTask {
     /// This function is unsafe as it requires the caller to ensure mutual
     /// exclusion.
     pub unsafe fn park(&self) {
-        if unsafe { (*self.task.get()).is_current() } {
+        if (*self.task.get()).is_current() {
             // Nothing more to do here
             return;
         }
@@ -60,13 +63,13 @@ impl AtomicTask {
         match self.state.compare_and_swap(WAITING, LOCKED_WRITE, Acquire) {
             WAITING => {
                 // Locked acquired, update the task cell
-                unsafe { *self.task.get() = task };
+                *self.task.get() = task;
 
                 // Release the lock. If the state transitioned to
                 // `LOCKED_NOTIFIED`, this means that an unpark has been
                 // signaled, so unpark the task.
                 if LOCKED_WRITE_NOTIFIED == self.state.swap(WAITING, Release) {
-                    unsafe { (*self.task.get()).unpark() };
+                    (*self.task.get()).unpark();
                 }
             }
             state => {
@@ -87,7 +90,7 @@ impl AtomicTask {
         loop {
             if curr == LOCKED_WRITE {
                 // Transition the state to LOCKED_NOTIFIED
-                let mut actual = self.state.compare_and_swap(LOCKED_WRITE, LOCKED_WRITE_NOTIFIED, Release);
+                let actual = self.state.compare_and_swap(LOCKED_WRITE, LOCKED_WRITE_NOTIFIED, Release);
 
                 if curr == actual {
                     // Success, return

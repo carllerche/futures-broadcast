@@ -1,3 +1,5 @@
+#![allow(dead_code)]
+
 pub use self::imp::AtomicU64;
 
 #[cfg(target_pointer_width = "64")]

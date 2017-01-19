@@ -114,3 +114,34 @@ fn wrapping_receiver_wait() {
 
     drop(pu);
 }
+
+#[test]
+fn single_tx_wait() {
+    const N: i32 = 25;
+
+    let (mut pu, su) = pubsub::channel::<i32>(2);
+
+    let (tx, rx) = mpsc::channel();
+
+    // Slow subscriber
+    thread::spawn(move || {
+        let mut su = su.wait();
+
+        for _ in 0..N {
+            thread::sleep(Duration::from_millis(10));
+            tx.send(su.next().unwrap().unwrap()).unwrap();
+        }
+    });
+
+    // Fast producer
+    for i in 0..N {
+        println!("SEND {:?}", i);
+        pu = pu.send(i).wait().unwrap();
+    }
+
+    for i in 0..N {
+        assert_eq!(i, rx.recv().unwrap());
+    }
+
+    assert!(rx.recv().is_err());
+}
