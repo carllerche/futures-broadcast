@@ -2,17 +2,19 @@
 extern crate futures;
 
 mod atomic_task;
+mod atomic_u64;
 
 use atomic_task::AtomicTask;
+use atomic_u64::AtomicU64;
 
 use futures::{Stream, Sink, Poll, StartSend, Async, AsyncSink};
 use futures::task::{self, Task};
 
-use std::{ops, mem, ptr, usize};
+use std::{ops, mem, ptr, u32, usize};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
 use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicPtr};
-use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
+use std::sync::atomic::Ordering::{self, Acquire, Release, AcqRel, Relaxed};
 
 // The core algorithm is based on the mpmc array channel from 1024 cores.
 //
@@ -36,55 +38,6 @@ use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
 // Separate TX & RX wait stacks are necessary as there could be races between a
 // TX trying to wait, and the RX pushing a value & another RX getting blocked on
 // the full entry.
-//
-// # Entry states
-//
-// * EMPTY
-// * EMPTY_WAITERS
-// * FULL - TX puts value from EMPTY state
-// * FULL_WAITERS - RX waiting for slot, includes value
-//
-// # Events
-//
-// 1 - RX calls `recv` and encounters `EMPTY` state.
-//   1.1 - Push waiter onto RX wait stack.
-//   1.2 - State `EMPTY` -> `EMPTY_WAITERS`
-//      1.2.1 - Fail w/ `FULL`, take waiters & notify if not self
-//      1.2.2 - Fail w/ `EMPTY_WAITERS`, do nothing
-//      1.2.3 - Success, return
-//
-// 2 - RX calls `recv` w/ `EMPTY_WAITERS` state.
-//    2.1 - Push waiter onto RX wait stack.
-//    2.2 - Confirm state `EMPTY_WAITERS`
-//      2.2.1 - Success, return
-//      2.2.2 - Fail w/ `FULL`, take waiters & notify if not self
-//
-// 3 - TX sends value, `EMPTY` state
-//   3.1 - Set value
-//   3.2 - Transition `EMPTY` -> `FULL`
-//      3.2.1 - Fail, state must be `EMPTY_WAITERS` GOTO 4.2
-//      3.2.2 - Success, no other work
-//
-// 4 - TX sends value, `EMPTY_WAITERS` state
-//   4.1 - Set value
-//   4.2 - Transition `EMPTY_WAITERS` -> `FULL` (must succeed)
-//      4.2.1 - Take all waiters & notify
-//
-//
-// # Sequence state
-//
-// `0` - Entry empty
-// `1` - Entry full
-// `2` - Empty with waiting subscribers
-// `3` - Full with waiting publisher
-//
-// # Limitations
-//
-// * The minimum capacity must be 4 in order to allow enough lower bits in the
-//   sequence number to store the entry state.
-//
-// * The max number of outstanding senders must be less than or equal to the
-//   channel capacity.
 
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
@@ -109,6 +62,9 @@ struct Inner<T> {
     // Buffer access mask
     mask: usize,
 
+    // Sequence value mask
+    seq_mask: usize,
+
     // Used by publishers and when receivers are cloned.
     pub_state: PubCell,
 
@@ -121,30 +77,31 @@ struct Inner<T> {
 // Currently, this is coordinated with a `Mutex`, however there are a bunch of
 // other strategies that could be used.
 struct PubCell {
-    pub_state: Mutex<PubState>,
+    pub_state: AtomicU64,
 }
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 struct PubState {
     // Current producer position
-    pos: usize,
+    pos: u32,
 
     // Number of outstanding receiver handles
-    num_rx: usize,
+    num_rx: u32,
 }
 
 struct Entry<T> {
-    // Atomic channel sequence number
-    sequence: AtomicUsize,
+    // Value being published
+    value: UnsafeCell<Option<T>>,
+
+    // Stores the entry state. This is a combination of the necessary flags to
+    // track the state as well as a pointer to the head of the waiting stack.
+    state: StateCell,
 
     // Number of remaining receivers to observe the value
     remaining: AtomicUsize,
 
-    // Value being published
-    value: UnsafeCell<Option<T>>,
-
     // Head of the `WaitingRx` stack
-    waiting_rx: AtomicPtr<WaitingRx>,
+    // waiting_rx: AtomicPtr<WaitingRx>,
 
     // Pointer to a waiting TX node.
     waiting_tx: AtomicPtr<WaitingTx<T>>,
@@ -169,8 +126,23 @@ struct WaitingTx<T> {
     parked: AtomicBool,
 }
 
-// Used as masks
-const FULL: usize = 1;
+struct StateCell {
+    state: AtomicUsize,
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq)]
+struct State {
+    // Pointer to the head of the waiting RXs
+    waiting_rx: *mut WaitingRx,
+
+    // The least significant bit of number of types the channel buffer has been
+    // cycled.
+    sequence: usize,
+
+    // TX and RX halves race to toggle this flag. If TX wins, then the slot is
+    // made available to an RX, if an RX wins, then the RX is blocked.
+    toggled: bool,
+}
 
 /// Returns a channel
 pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
@@ -234,51 +206,55 @@ impl<T> Sink for Sender<T> {
         }
 
         let mask = self.inner.mask;
-        let mut pub_state = self.inner.pub_state.load();
+        let seq_mask = self.inner.seq_mask;
+
+        // Claim a lot, this does not need to be guarded like in the original
+        // MPMC queue because the size restrictions on the channel and the
+        // `is_parked` is a sufficient guard.
+        let pub_state = self.inner.pub_state.claim_slot();
+
+        // Get the sequence value for the given position
+        let seq = pos_to_sequence(pub_state.pos(), seq_mask);
+
+        // Get a handle to the entry
+        let entry = &self.inner.buffer[pub_state.pos() & mask];
+
+        // Load the current entry state
+        let mut entry_state = entry.state.load(Acquire);
 
         loop {
-            let entry = &self.inner.buffer[pub_state.pos & mask];
-            let seq = entry.sequence.load(Acquire);
+            debug_assert!(seq != entry_state.sequence);
 
-            if seq == pub_state.pos {
-                // The slot is available, we can attempt to acquire the slot
-                match self.inner.pub_state.claim_slot(pub_state) {
-                    Ok(_) => {
-                        // CAS succeeded, update the value
-                        entry.set(item, pub_state);
+            if entry_state.toggled {
+                // The subscriber has released this slot and the publisher may
+                // write a value to it.
+                entry.set(item, pub_state);
 
-                        let color = color_for(pub_state.pos, mask);
+                // A CAS loop for updating the entry state.
+                loop {
+                    let next = State {
+                        waiting_rx: ptr::null_mut(),
+                        sequence: seq,
+                        toggled: false,
+                        .. entry_state
+                    };
 
-                        // Notify receivers
-                        entry.notify_rx(color);
+                    let actual = entry.state.compare_and_swap(entry_state, next, Release);
 
-                        return Ok(AsyncSink::Ready);
+                    if actual == entry_state {
+                        break;
                     }
-                    Err(actual_state) => {
-                        // CAS failed, try again
-                        pub_state = actual_state;
-                    }
+
+                    entry_state = actual;
                 }
-            } else if seq < pub_state.pos {
-                match self.inner.pub_state.claim_slot(pub_state) {
-                    Ok(_) => {
-                        let waiter = tx_waiter(&mut self.waiter, item);
 
-                        if entry.tx_wait(waiter) {
-                            return Ok(AsyncSink::Ready);
-                        }
-                        else {
-                            unimplemented!();
-                        }
-                    }
-                    Err(actual_state) => {
-                        // CAS failed, try again
-                        pub_state = actual_state;
-                    }
-                }
+                // Notify waiters
+                entry_state.notify_rx();
+
+                return Ok(AsyncSink::Ready);
+
             } else {
-                // Try again
-                pub_state = self.inner.pub_state.load();
+                unimplemented!();
             }
         }
     }
@@ -288,6 +264,15 @@ impl<T> Sink for Sender<T> {
     }
 }
 
+fn pos_to_sequence(pos: usize, mask: usize) -> usize {
+    if pos & mask == 0 {
+        0
+    } else {
+        1
+    }
+}
+
+/*
 fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T) -> Arc<WaitingTx<T>> {
     if let Some(ref w) = *cell {
         unsafe {
@@ -310,6 +295,7 @@ fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T) -> Arc<WaitingTx<
     *cell = Some(w.clone());
     w
 }
+*/
 
 impl<T> Drop for Sender<T> {
     fn drop(&mut self) {
@@ -337,61 +323,68 @@ impl<T> Receiver<T> {
 
     pub fn recv(&mut self) -> Poll<Option<RecvGuard<T>>, ()> {
         let mask = self.inner.mask;
+        let seq_mask = self.inner.seq_mask;
         let pos = self.pos;
 
         // A little bit of misdirection to make the borrow checker happy.
         let value = {
             // Get the entry at the current position
             let entry = &self.inner.buffer[pos & mask];
+            let mut entry_state = entry.state.load(Acquire);
 
-            // Get the sequence number
-            let seq = entry.sequence.load(Acquire);
+            let seq = pos_to_sequence(pos, seq_mask);
 
-            let diff: isize = (seq as isize).wrapping_sub((pos + 1) as isize);
-
-            if diff == 0 {
-                // The slot is full, get a reference to the value.
-                unsafe {
-                    (*entry.value.get()).as_ref().unwrap()
-                }
-            }
-            else {
+            if seq != entry_state.sequence {
                 // No value present, attempt to wait
                 //
                 // First, get a waiter. `rx_waiter` ensures that the
                 // `Receiver`'s wait node references the current task.
                 let waiter = rx_waiter(&mut self.waiter);
 
-                // Push the node onto the stack, returns `false` if the TX half
-                // has "terminated" the stack indicating that a value is now
-                // available.
-                let color = color_for(pos, mask);
+                // Transmute the waiter to an unsafe pointer. This ptr will
+                // be stored in the state slot
+                let node_ptr: *mut WaitingRx = unsafe { mem::transmute(waiter) };
 
-                if push_waiter(&entry.waiting_rx, waiter, color) {
-                    // The wait has been successfully issued, now return w/
-                    // NotReady
-                    return Ok(Async::NotReady);
-                }
-
-                // Pushing the node failed, this implies that the TX half
-                // "shutdown" the wait queue, transitioning to `FULL`.
-                //
-                // `Relaxed` ordering is used here as the memory ordering is
-                // actually established in `push_node`.
-
-                let seq = entry.sequence.load(Relaxed);
-                let diff: isize = (seq as isize).wrapping_sub((pos + 1) as isize);
-
-                if diff == 0 {
-                    // The entry is full, get a reference to the value.
+                loop {
+                    // Update the next pointer.
+                    //
+                    // Relaxed ordering is used as the waiter node is not
+                    // currently shared with other threads.
                     unsafe {
-                        (*entry.value.get()).as_ref().unwrap()
+                        (*node_ptr).next.store(entry_state.waiting_rx, Relaxed);
                     }
-                } else {
-                    // The entry is not full, meaning that all TX handles were
-                    // dropped.
-                    unimplemented!();
+
+                    let next = State {
+                        waiting_rx: node_ptr,
+                        .. entry_state
+                    };
+
+                    // Attempt to CAS the new state
+                    let actual = entry.state.compare_and_swap(entry_state, next, AcqRel);
+
+                    if actual == entry_state {
+                        // The wait has successfully been registered, so return
+                        // with NotReady
+                        return Ok(Async::NotReady);
+                    }
+
+                    // The CAS failed, maybe the value is not ready. This is why
+                    // Acq is used in the CAS.
+                    if seq == entry_state.sequence {
+                        // The Arc must be cleaned up...
+                        let _: Arc<WaitingRx> = unsafe { mem::transmute(node_ptr) };
+                        break;
+                    }
+
+                    // The CAS failed for another reason, update the state and
+                    // try again.
+                    entry_state = actual;
                 }
+            }
+
+            // Read the value
+            unsafe {
+                (*entry.value.get()).as_ref().unwrap()
             }
         };
 
@@ -419,77 +412,6 @@ fn rx_waiter(cell: &mut Option<Arc<WaitingRx>>) -> Arc<WaitingRx> {
 
     *cell = Some(w.clone());
     w
-}
-
-// TODO: Move this to a fn on `Entry`
-fn push_waiter(head: &AtomicPtr<WaitingRx>, node: Arc<WaitingRx>, target_color: usize) -> bool {
-    // Push a waiter node onto the atomic wait stack.
-    unsafe {
-        // Only push nodes without a `next` pointer
-        if !node.next.load(Acquire).is_null() {
-            // Task is currently queued
-            return true;
-        }
-
-        let mut curr = head.load(Acquire);
-
-        // Transmute the Arc<WaitingRx> -> an unsafe ptr. This ptr will be
-        // stored in the AtomicPtr stack
-        let node_ptr: *mut WaitingRx = mem::transmute(node);
-
-        loop {
-            let (head_ptr, color) = atomic_to_ptr_and_color(curr);
-
-            if color == target_color {
-                // The wait stack is closed. The node will not be CASed to the
-                // stack, so transmute back to the Arc so that the refcount is
-                // decremented and unset the `next` node before the value is
-                // dropped.
-                let _: Arc<WaitingRx> = mem::transmute(node_ptr);
-
-                return false;
-            }
-
-            // Update next pointer.
-            (*node_ptr).next.store(head_ptr, Relaxed);
-
-            let next = ptr_and_color_to_atomic(node_ptr, color);
-            let actual = head.compare_and_swap(curr, next, Release);
-
-            if actual == curr {
-                return true;
-            }
-
-            curr = actual;
-        }
-    }
-}
-
-/// Splits the value in the `AtomicPtr` into the actual pointer and the color
-fn atomic_to_ptr_and_color<T>(ptr: *mut T) -> (*mut T, usize) {
-    let ptr = ptr as usize;
-    let color = ptr & 1;
-    let ptr = (ptr & !1) as *mut T;
-
-    (ptr, color)
-}
-
-/// Combines a pointer and a color into a single pointer to store in the
-/// `AtomicPtr`
-fn ptr_and_color_to_atomic<T>(ptr: *mut T, color: usize) -> *mut T {
-    let ptr = ptr as usize | color;
-    ptr as *mut T
-}
-
-/// Takes a `pos` and a `mask` and returns the associated color
-fn color_for(pos: usize, mask: usize) -> usize {
-    let mask = (mask << 1) & (!mask);
-
-    if pos & mask == 0 {
-        0
-    } else {
-        1
-    }
 }
 
 impl<T: Clone> Stream for Receiver<T> {
@@ -524,27 +446,29 @@ impl<T> Inner<T> {
         // Initialize the ring as a vec of vaccant entries
         let mut buffer = Vec::with_capacity(capacity);
 
-        // Initialize the waiting_rx, setting the color to `1`
-        let waiting_rx = ptr_and_color_to_atomic(ptr::null_mut(), 1);
-
         for i in 0..capacity {
             buffer.push(Entry {
-                sequence: AtomicUsize::new(i),
+                state: StateCell::new(),
                 value: UnsafeCell::new(None),
                 remaining: AtomicUsize::new(0),
-                waiting_rx: AtomicPtr::new(waiting_rx),
                 waiting_tx: AtomicPtr::new(ptr::null_mut()),
             });
         }
 
+        let mask = capacity - 1;
+
         Inner {
             buffer: buffer,
-            mask: capacity - 1,
+            mask: mask,
+            seq_mask: (mask << 1) & (!mask),
             pub_state: PubCell::new(),
             num_tx: AtomicUsize::new(1),
         }
     }
 }
+
+unsafe impl<T: Send + Sync> Send for Sender<T> {}
+unsafe impl<T: Send + Sync> Sync for Sender<T> {}
 
 unsafe impl<T: Send + Sync> Send for Inner<T> {}
 unsafe impl<T: Send + Sync> Sync for Inner<T> {}
@@ -553,40 +477,103 @@ unsafe impl<T: Send + Sync> Sync for Inner<T> {}
 
 impl PubCell {
     fn new() -> PubCell {
-        PubCell {
-            pub_state: Mutex::new(PubState {
-                pos: 0,
-                num_rx: 1,
-            }),
-        }
+        let v = PubState::new().as_u64();
+
+        PubCell { pub_state: AtomicU64::new(v) }
     }
 
     // Loads the state
-    fn load(&self) -> PubState {
-        let state = self.pub_state.lock().unwrap();
-        *state
+    fn load(&self, ordering: Ordering) -> PubState {
+        let val = self.pub_state.load(ordering);
+        PubState::load(val)
     }
 
-    fn claim_slot(&self, expect: PubState) -> Result<(), PubState> {
-        let mut state = self.pub_state.lock().unwrap();
+    fn compare_and_swap(&self, current: PubState, new: PubState, ordering: Ordering) -> PubState {
+        let val = self.pub_state.compare_and_swap(current.as_u64(), new.as_u64(), ordering);
+        PubState::load(val)
+    }
 
-        if *state == expect {
-            state.pos += 1;
-            Ok(())
-        } else {
-            Err(*state)
+    /// Claim the next publish spot and return the new `PubState`
+    ///
+    /// Uses `Relaxed` ordering
+    fn claim_slot(&self) -> PubState {
+        let mut curr = self.load(Relaxed);
+
+        loop {
+            let next = PubState {
+                pos: curr.pos.wrapping_add(1),
+                .. curr
+            };
+
+            let actual = self.compare_and_swap(curr, next, Relaxed);
+
+            if curr == actual {
+                return curr;
+            }
+
+            curr = actual
         }
     }
 
+    /// Atomically increment the number of outstanding RX handles and return the
+    /// current "head" position.
+    ///
+    /// Uses `Relaxed` ordering
     fn inc_rx(&self) -> usize {
-        let mut state = self.pub_state.lock().unwrap();
+        let mut curr = self.load(Relaxed);
 
-        if state.num_rx == usize::MAX {
-            panic!();
+        loop {
+            if curr.num_rx == u32::MAX {
+                // TODO: return this as an error
+                panic!();
+            }
+
+            let next = PubState {
+                num_rx: curr.num_rx + 1,
+                .. curr
+            };
+
+            let actual = self.compare_and_swap(curr, next, Relaxed);
+
+            if curr == actual {
+                return next.pos();
+            }
+
+            curr = actual;
         }
+    }
+}
 
-        state.num_rx += 1;
-        state.pos
+// ===== impl PubState =====
+
+impl PubState {
+    /// Return a new `PubState` with default values
+    fn new() -> PubState {
+        PubState {
+            pos: 0,
+            num_rx: 1,
+        }
+    }
+
+    fn pos(&self) -> usize {
+        self.pos as usize
+    }
+
+    fn num_rx(&self) -> usize {
+        self.num_rx as usize
+    }
+
+    /// Load a `PubState` from its u64 representation
+    fn load(val: u64) -> PubState {
+        PubState {
+            pos: (val >> 32) as u32,
+            num_rx: (val & (u32::MAX as u64)) as u32,
+        }
+    }
+
+    /// Return the u64 representation for this `PubState`
+    fn as_u64(&self) -> u64 {
+        ((self.pos as u64) << 32) | (self.num_rx as u64)
     }
 }
 
@@ -600,22 +587,69 @@ impl<T> Entry<T> {
         }
 
         // Set the number of remaining subscribers to observe
-        self.remaining.store(pub_state.num_rx, Relaxed);
+        //
+        // The `Relaxed` ordering is sufficient here as all receivers with
+        // `Acquire` this memory when loading the entry state.
+        self.remaining.store(pub_state.num_rx(), Relaxed);
+    }
+}
 
-        // Store the sequence number, which makes the entry visible to
-        // subscribers
-        self.sequence.store(pub_state.pos + 1, Release);
+// ===== impl StateCell =====
+
+impl StateCell {
+    fn new() -> StateCell {
+        let val = State::new().as_usize();
+
+        StateCell {
+            state: AtomicUsize::new(val),
+        }
     }
 
-    fn notify_rx(&self, color: usize) {
-        let closed_ptr = ptr_and_color_to_atomic(ptr::null_mut(), color);
+    fn load(&self, ordering: Ordering) -> State {
+        let val = self.state.load(ordering);
+        State::load(val)
+    }
 
-        // Take the stack of waiters
-        //
-        // Acquire the waiting_rx state and release the "set value" state.
-        let curr = self.waiting_rx.swap(closed_ptr, AcqRel);
+    fn compare_and_swap(&self, current: State, next: State, ordering: Ordering) -> State {
+        let val = self.state.compare_and_swap(current.as_usize(), next.as_usize(), ordering);
+        State::load(val)
+    }
+}
 
-        let (mut ptr, _) = atomic_to_ptr_and_color(curr);
+// ===== impl State =====
+
+impl State {
+    /// Return a new `State` value
+    fn new() -> State {
+        State {
+            waiting_rx: ptr::null_mut(),
+            sequence: 1,
+            toggled: true,
+        }
+    }
+
+    /// Load a `State` value from its `usize` representation
+    fn load(val: usize) -> State {
+        State {
+            waiting_rx: (val & !3) as *mut WaitingRx,
+            sequence: val & 1,
+            toggled: (val & 2) == 2,
+        }
+    }
+
+    /// Return the `usize` representation of this `State`
+    fn as_usize(&self) -> usize {
+        let mut val = self.waiting_rx as usize | self.sequence;
+
+        if self.toggled {
+            val |= 2;
+        }
+
+        val
+    }
+
+    fn notify_rx(&self) {
+        let mut ptr = self.waiting_rx;
 
         while !ptr.is_null() {
             unsafe {
@@ -651,15 +685,36 @@ impl<'a, T> Drop for RecvGuard<'a, T> {
         let entry = &self.recv.inner.buffer[pos & mask];
 
         // Decrement the remaining receivers
-        if 1 == entry.remaining.fetch_sub(1, Release) {
+        if 1 == entry.remaining.fetch_sub(1, AcqRel) {
             // Remove the value
             unsafe { (*entry.value.get()) = None };
 
-            // Update the entry sequence value, this makes the slot available to
-            // producers.
-            entry.sequence.store(pos + mask + 1, Release);
+            // The next step is to release the slot. This is done by updating
+            // the entry state.
+            //
+            // Load the current state, `Acquire` is used in case a `TX` is
+            // waiting
+            let mut entry_state = entry.state.load(Acquire);
 
-            // TODO: Notify producers
+            loop {
+                if entry_state.toggled {
+                    // A TX is waiting
+                    unimplemented!();
+                }
+
+                let next = State {
+                    toggled: true,
+                    .. entry_state
+                };
+
+                let actual = entry.state.compare_and_swap(entry_state, next, Release);
+
+                if entry_state == actual {
+                    break;
+                }
+
+                entry_state = actual;
+            }
         }
 
         // Increment the position
