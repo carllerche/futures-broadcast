@@ -11,7 +11,7 @@ use futures::task::{self, Task};
 use std::{ops, mem, ptr, usize};
 use std::cell::UnsafeCell;
 use std::sync::{Arc, Mutex};
-use std::sync::atomic::{AtomicUsize, AtomicPtr};
+use std::sync::atomic::{AtomicBool, AtomicUsize, AtomicPtr};
 use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
 
 // The core algorithm is based on the mpmc array channel from 1024 cores.
@@ -88,6 +88,7 @@ use std::sync::atomic::Ordering::{Acquire, Release, AcqRel, Relaxed};
 
 pub struct Sender<T> {
     inner: Arc<Inner<T>>,
+    waiter: Option<Arc<WaitingTx<T>>>,
 }
 
 pub struct Receiver<T> {
@@ -162,7 +163,10 @@ struct WaitingTx<T> {
     task: AtomicTask,
 
     // queued value
-    value: T,
+    value: UnsafeCell<Option<T>>,
+
+    // True if parked
+    parked: AtomicBool,
 }
 
 // Used as masks
@@ -174,6 +178,7 @@ pub fn channel<T>(capacity: usize) -> (Sender<T>, Receiver<T>) {
 
     let tx = Sender {
         inner: inner.clone(),
+        waiter: None,
     };
 
     let rx = Receiver {
@@ -203,10 +208,18 @@ impl<T> Sender<T> {
             if actual == curr {
                 return Ok(Sender {
                     inner: self.inner.clone(),
+                    waiter: None,
                 });
             }
 
             curr = actual;
+        }
+    }
+
+    fn is_parked(&self) -> bool {
+        match self.waiter {
+            Some(ref w) => w.parked.load(Acquire),
+            None => false,
         }
     }
 }
@@ -216,6 +229,10 @@ impl<T> Sink for Sender<T> {
     type SinkError = ();
 
     fn start_send(&mut self, item: T) -> StartSend<T, ()> {
+        if self.is_parked() {
+            return Ok(AsyncSink::NotReady(item));
+        }
+
         let mask = self.inner.mask;
         let mut pub_state = self.inner.pub_state.load();
 
@@ -243,8 +260,22 @@ impl<T> Sink for Sender<T> {
                     }
                 }
             } else if seq < pub_state.pos {
-                // Full
-                unimplemented!();
+                match self.inner.pub_state.claim_slot(pub_state) {
+                    Ok(_) => {
+                        let waiter = tx_waiter(&mut self.waiter, item);
+
+                        if entry.tx_wait(waiter) {
+                            return Ok(AsyncSink::Ready);
+                        }
+                        else {
+                            unimplemented!();
+                        }
+                    }
+                    Err(actual_state) => {
+                        // CAS failed, try again
+                        pub_state = actual_state;
+                    }
+                }
             } else {
                 // Try again
                 pub_state = self.inner.pub_state.load();
@@ -254,6 +285,39 @@ impl<T> Sink for Sender<T> {
 
     fn poll_complete(&mut self) -> Poll<(), ()> {
         Ok(Async::Ready(()))
+    }
+}
+
+fn tx_waiter<T>(cell: &mut Option<Arc<WaitingTx<T>>>, item: T) -> Arc<WaitingTx<T>> {
+    if let Some(ref w) = *cell {
+        unsafe {
+            w.task.park();
+
+            (*w.value.get()) = Some(item);
+        }
+
+        w.parked.store(true, Release);
+
+        return w.clone();
+    }
+
+    let w = Arc::new(WaitingTx {
+        task: AtomicTask::new(task::park()),
+        value: UnsafeCell::new(Some(item)),
+        parked: AtomicBool::new(true),
+    });
+
+    *cell = Some(w.clone());
+    w
+}
+
+impl<T> Drop for Sender<T> {
+    fn drop(&mut self) {
+        let prev = self.inner.num_tx.fetch_sub(1, AcqRel);
+
+        if prev == 1 {
+            // TODO: implement notifying
+        }
     }
 }
 
@@ -427,13 +491,6 @@ fn color_for(pos: usize, mask: usize) -> usize {
         1
     }
 }
-
-/*
-/// Returns a "closed" token
-fn closed<T>() -> *mut T {
-    unsafe { mem::transmute(1usize) }
-}
-*/
 
 impl<T: Clone> Stream for Receiver<T> {
     type Item = T;
